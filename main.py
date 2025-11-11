@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 import os, re
 from pathlib import Path
@@ -9,11 +8,7 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-
-
 from fastapi.middleware.cors import CORSMiddleware
-
-
 
 # Config & data paths
 OUTDIR = Path(os.getenv("STACKREC_OUTDIR", "out_cleaned"))
@@ -35,13 +30,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Utilities – normalization & variants (keep consistent with your notebook)
+# Utilities — normalization & variants (keep consistent with your notebook)
 _ALIAS = {
     "js": "javascript", "ts": "typescript", "py": "python", "rb": "ruby",
     "postgres": "postgresql", "mongo": "mongodb", "tf": "tensorflow",
     "sklearn": "scikit-learn", "k8s": "kubernetes", "gcp": "google cloud",
     "rn": "react native", "next.js": "nextjs", "react.js": "react", "node.js": "node",
 }
+
+def _canon(t: str) -> str:
+    """Canonicalize token for consistent comparison."""
+    return str(t or '').strip().lower()
 
 def _norm_list(xs) -> List[str]:
     if xs is None:
@@ -116,7 +115,7 @@ _stack_allow = defaultdict(set)
 for _, r in df_kw.iterrows():
     stk = r["stack"]
     for t in str(r["keywords"]).split():
-        _stack_allow[stk].add(t.lower())
+        _stack_allow[stk].add(_canon(t))
 
 def _guess_category_for_stack(stk: str) -> str:
     return stk
@@ -126,6 +125,27 @@ _CATEGORY_STOP = {
     "Systems": {"css", "html", "javascript", "react", "vue", "angular"},
     "GameDev": {"css", "html", "jquery"},
     "Mobile": {"jquery", "php"},
+}
+
+# **NEW: Core libraries mapping (from notebook)**
+_CORE_LIBS = {
+    'AI/ML': {
+        'python': ['pytorch', 'tensorflow', 'keras', 'scikit-learn',
+                   'xgboost', 'lightgbm', 'numpy', 'pandas'],
+        'r': ['ggplot2', 'caret', 'shiny', 'tidyverse'],
+        'julia': ['flux']
+    },
+    'Web': {
+        'python': ['django', 'flask', 'fastapi'],
+        'javascript': ['react', 'next.js', 'vue.js', 'angular', 'express', 'node.js'],
+        'typescript': ['next.js', 'nestjs', 'react', 'angular']
+    },
+    'Mobile': {
+        'javascript': ['react native'],
+        'typescript': ['react native'],
+        'swift': ['swiftui'],
+        'kotlin': ['jetpack compose']
+    }
 }
 
 INTEREST_TO_STACK = {
@@ -175,31 +195,54 @@ def _interest_buckets(interests) -> List[str]:
             out.append(b); seen.add(b)
     return out
 
-def suggest_techs_to_learn(stack: str, known_tokens=None, k: int = 6) -> List[str]:
-    known = {t.lower() for t in (known_tokens or []) if t}
+# **FIXED: suggest_techs_to_learn with for_new_entrant parameter**
+def suggest_techs_to_learn(stack: str, known_tokens=None, k: int = 6, *, for_new_entrant: bool = False) -> List[str]:
+    """
+    Category-aware suggestions with allowlist + frequency ranking.
+    If for_new_entrant=True, apply language-aware core-library boost (e.g., Python in AI/ML).
+    Professionals do NOT get this boost by default.
+    """
+    known = {_canon(t) for t in (known_tokens or []) if t}
     kws = str(df_kw.loc[df_kw["stack"] == stack, "keywords"].squeeze() or "").split()
+    
+    # 1) keep only tokens that are actually observed for this stack
     allow = _stack_allow.get(stack, set())
-    cand = [t for t in kws if t and t.lower() in allow and t.lower() not in known]
-    # category stoplist
+    cand = [t for t in kws if t and _canon(t) in allow and _canon(t) not in known]
+    
+    # 2) drop category-inappropriate basics
     cat = _guess_category_for_stack(stack)
     stop = _CATEGORY_STOP.get(cat, set())
-    cand = [t for t in cand if t.lower() not in stop]
-    scored = [(t, _token_freq.get(t, 0)) for t in cand]
+    cand = [t for t in cand if _canon(t) not in stop]
+    
+    if not cand:
+        return []
+    
+    # 3) base score by frequency (+ optional entrant-only boost)
+    scored = []
+    core_for_stack = _CORE_LIBS.get(stack, {})
+    
+    for t in cand:
+        tok = _canon(t)
+        base = _token_freq.get(tok, 0)
+        
+        boost = 0
+        if for_new_entrant:
+            for lang in known:
+                if lang in core_for_stack and tok in map(_canon, core_for_stack[lang]):
+                    boost += 250_000  # modest but decisive bump for entrants
+        
+        scored.append((tok, base + boost))
+    
+    # 4) sort & dedupe
     scored.sort(key=lambda x: (-x[1], x[0]))
-    return [t for t, _ in scored[:k]]
-
-
-_AI_CORE = {"python", "pytorch", "tensorflow", "scikit-learn", "numpy", "pandas", "matplotlib"}
-
-def _boost_learn_next_if_py_ml(stack: str, langs_norm: set[str], interests_norm: List[str], items: List[str]) -> List[str]:
-    if stack == "AI/ML" and ("python" in langs_norm or "ml" in interests_norm or "machine learning" in interests_norm):
-        uniq = []
-        seen = set()
-        for t in list(_AI_CORE) + items:
-            if t not in seen:
-                uniq.append(t); seen.add(t)
-        return uniq[:6]
-    return items
+    seen, out = set(), []
+    for tok, _ in scored:
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+        if len(out) >= k:
+            break
+    return out
 
 
 def recommend_new_entrant_rule(
@@ -226,15 +269,21 @@ def recommend_new_entrant_rule(
 
         score = 2.0 * (stack in buckets) + 1.0 * min(overlap, 3) + 0.5 * A - 0.5 * B
 
-        reasons = []
-        if stack in buckets: reasons.append("interest match")
-        if overlap: reasons.append(f"{overlap} overlap")
-        if A > 0: reasons.append("popular")
-        if B <= 0.4: reasons.append("lower barrier")
+        # **FIXED: reason string logic matching notebook (order and thresholds)**
+        reason_parts = []
+        if overlap:
+            reason_parts.append(f"{overlap} overlap")
+        if stack in buckets:
+            reason_parts.append("interest match")
+        if A > 0.4:
+            reason_parts.append("popular")
+        if B < 0.4:
+            reason_parts.append("lower barrier")
+        
+        reason = "; ".join(reason_parts) if reason_parts else "general fit"
 
-        learn_next = suggest_techs_to_learn(stack, known_tokens=langs, k=6)
-        if entrant_boost:
-            learn_next = _boost_learn_next_if_py_ml(stack, langs, _norm_list(areas_of_interest), learn_next)
+        # **FIXED: Pass for_new_entrant parameter directly**
+        learn_next = suggest_techs_to_learn(stack, known_tokens=langs, k=6, for_new_entrant=entrant_boost)
 
         rows.append({
             "stack": stack,
@@ -242,7 +291,7 @@ def recommend_new_entrant_rule(
             "overlap": int(overlap),
             "A_t_norm": round(A, 3),
             "BarrierScore_norm": round(B, 3),
-            "reason": "; ".join(reasons) if reasons else "general fit",
+            "reason": reason,
             "learn_next": learn_next,
             "top_techs": learn_next[:3],
         })
@@ -290,7 +339,8 @@ def recommend_professional_rule(
         if S > 0.6: reasons.append("rising/desired")
         if prefer_low_barrier and B > 0.5: reasons.append("penalized barrier")
 
-        learn_next = suggest_techs_to_learn(stack, known_tokens=known, k=6)
+        # Professionals don't get entrant boost
+        learn_next = suggest_techs_to_learn(stack, known_tokens=known, k=6, for_new_entrant=False)
 
         rows.append({
             "stack": stack,
@@ -333,7 +383,6 @@ _LANG_TO_FRAMEWORKS = {
 def recommend_frameworks_by_language(languages_known: List[str], interests: Optional[str | List[str]] = None, topk: int = 12) -> List[str]:
     langs = _norm_list(languages_known)
     baskets = set(_interest_buckets(interests)) if interests else set()
-    # if interest mentions web/backend/mobile/data… bias to relevant lang families (keep simple for now)
     candidates = []
     for l in langs:
         candidates.extend(_LANG_TO_FRAMEWORKS.get(l, []))
